@@ -256,7 +256,19 @@ type openAIRequest struct {
 }
 
 func (s *server) handleModels(w http.ResponseWriter, r *http.Request) {
-	ids := []string{"pixis-opus", "pixis", "forge", "ml-ai", "auto"}
+	// ids as the CLI reports them (`mlai -p … -m <bad>` prints the authoritative list)
+	ids := []string{
+		"pixis",             // fast, coding-tuned
+		"pixis-opus",        // Opus 5.5R — strongest, default
+		"pixis-sol",         // GPT 6.1R Sol — fast, large context
+		"ml-ai-forge",       // ML.ai Forge (text only)
+		"gpt-6-astra",       // most capable GPT (credits)
+		"grok-4.7",          // xAI reasoning (credits)
+		"mlai-coder",        // ML.ai Coder (credits)
+		"glm-5.3",           // GLM 5.3 (credits, text only)
+		"claude-sonnet-5.5", // Anthropic Sonnet (credits)
+		"claude-fable-5.2",  // Anthropic Fable (credits)
+	}
 	data := make([]map[string]any, 0, len(ids))
 	for _, id := range ids {
 		data = append(data, map[string]any{
