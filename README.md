@@ -18,12 +18,31 @@ can talk to it.
 - `POST /v1/messages` — Anthropic Messages (stream + non-stream), `tool_use` blocks
 - `POST /v1/messages/count_tokens` — token estimate
 - `GET /v1/models`, `GET /healthz`, `GET /metrics`
+- **Direct mode** (default): talks to `code.ml.ai/api/model/v1/chat/completions` with a
+  live run token, so streams are real token deltas (TTFT < 1 s, ~110–160 tok/s) with no
+  agent-harness prompt. Falls back to the CLI automatically if the gateway rejects the run.
 - Token accounting in every response — `prompt/input`, `completion/output`, `total`,
   `cached_tokens`; also emitted as a final usage chunk on streams
 - Identical-request cache (`-cache-ttl`, default 10m) with `X-Cache: HIT|MISS`
 - Bounded concurrency with a queue (`-concurrency`, `-queue-wait`)
 - Stable error codes mapped from CLI failures (see below)
 - Circuit-free, dependency-free single binary (Go stdlib only)
+
+## Direct mode and the run keeper
+
+The gateway accepts a per-run bearer token (`mlrun_…`) that only the CLI can mint, and it
+dies when the run ends. The bridge therefore keeps **one background CLI run alive**
+(`mlai --bg -y "Run the shell command \`sleep 5400\`…"` in `<workdir>/.keeper`) and reuses
+that run's token from `~/.mlai/sessions/<id>/engine/mcp.json`. When the gateway answers
+`409 run_finished`, the bridge opens a fresh keeper run and retries the request once.
+
+```
+client ─► bridge ─► code.ml.ai/api/model/v1/chat/completions   (direct: real SSE)
+                 └► mlai --bg (keeper: keeps the run token alive)
+```
+
+Disable it with `-direct=false` to always use the CLI path (slower: ~10–16 s to first
+token, because the CLI buffers the whole answer).
 
 ## Requirements
 

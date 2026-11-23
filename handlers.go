@@ -317,6 +317,37 @@ func (s *server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		convo = append(convo, m)
 	}
 
+	// Fast path: talk to the gateway directly — real token streaming, no CLI overhead.
+	if s.direct {
+		body := openAIBodyFromOpenAI(req, model)
+		if resp, derr := s.directRequest(r.Context(), body, req.Stream); derr == nil {
+			if req.Stream {
+				copySSE(w, resp)
+				return
+			}
+			text, gwModel, usage, aerr := aggregateGateway(resp)
+			if aerr == nil {
+				if gwModel == "" {
+					gwModel = model
+				}
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]any{
+					"id": fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()), "object": "chat.completion",
+					"created": time.Now().Unix(), "model": gwModel,
+					"choices": []map[string]any{{
+						"index": 0, "finish_reason": "stop",
+						"message": map[string]any{"role": "assistant", "content": text},
+					}},
+					"usage": usage,
+				})
+				return
+			}
+			logger.Printf("direct aggregate failed: %v", aerr)
+		} else {
+			logger.Printf("direct path failed (%v) — falling back to CLI", derr)
+		}
+	}
+
 	res := s.execute(r.Context(), model, system, convo, req.Tools, cfg.Effort, req.MaxTokens)
 	if res.err != nil {
 		writeOpenAIError(w, *res.err, reqID)
@@ -472,6 +503,21 @@ func (s *server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 				}
 				system = strings.TrimSpace(b.String())
 			}
+		}
+	}
+
+	// Fast path: gateway direct (real streaming), CLI as fallback.
+	if s.direct {
+		body := openAIBodyFromAnthropic(req, model)
+		if resp, derr := s.directRequest(r.Context(), body, req.Stream); derr == nil {
+			if req.Stream {
+				streamToAnthropic(w, resp, model)
+				return
+			}
+			anthropicFromGateway(w, resp, model)
+			return
+		} else {
+			logger.Printf("direct path failed (%v) — falling back to CLI", derr)
 		}
 	}
 

@@ -32,6 +32,7 @@ type config struct {
 	CacheTTL     time.Duration
 	CacheSize    int
 	Effort       string
+	Direct       bool
 }
 
 var (
@@ -55,7 +56,15 @@ func initFlags() {
 	flag.DurationVar(&cfg.CacheTTL, "cache-ttl", 10*time.Minute, "identical-request cache TTL (0 disables)")
 	flag.IntVar(&cfg.CacheSize, "cache-size", 512, "cache entries")
 	flag.StringVar(&cfg.Effort, "effort", envStr("MLAI_EFFORT", ""), "reasoning effort: low|medium|high|max")
+	flag.BoolVar(&cfg.Direct, "direct", envBool("MLAI_DIRECT", true), "talk to the gateway directly (real token streaming) with CLI fallback")
 	flag.Parse()
+}
+
+func envBool(k string, def bool) bool {
+	if v := os.Getenv(k); v != "" {
+		return v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
+	}
+	return def
 }
 
 func envStr(k, d string) string {
@@ -79,6 +88,8 @@ type server struct {
 	runner *Runner
 	cache  *LRU
 	sem    chan struct{}
+	keeper *runKeeper
+	direct bool
 }
 
 func newServer() *server {
@@ -91,6 +102,8 @@ func newServer() *server {
 		runner: &Runner{Bin: cfg.MLAI, WorkDir: cfg.WorkDir, Timeout: int(cfg.Timeout.Seconds())},
 		cache:  c,
 		sem:    make(chan struct{}, maxInt(1, cfg.Concurrency)),
+		keeper: newRunKeeper(cfg.MLAI, cfg.WorkDir),
+		direct: cfg.Direct,
 	}
 }
 
