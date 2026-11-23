@@ -33,6 +33,8 @@ type config struct {
 	CacheSize    int
 	Effort       string
 	Direct       bool
+	Bind         string
+	APIKey       string
 }
 
 var (
@@ -57,6 +59,8 @@ func initFlags() {
 	flag.IntVar(&cfg.CacheSize, "cache-size", 512, "cache entries")
 	flag.StringVar(&cfg.Effort, "effort", envStr("MLAI_EFFORT", ""), "reasoning effort: low|medium|high|max")
 	flag.BoolVar(&cfg.Direct, "direct", envBool("MLAI_DIRECT", true), "talk to the gateway directly (real token streaming) with CLI fallback")
+	flag.StringVar(&cfg.Bind, "bind", envStr("MLAI_BIND", "127.0.0.1"), "listen address (0.0.0.0 to expose; set -api-key first)")
+	flag.StringVar(&cfg.APIKey, "api-key", envStr("MLAI_API_KEY", ""), "require this bearer key on /v1/* (empty = open, loopback only)")
 	flag.Parse()
 }
 
@@ -199,17 +203,21 @@ func main() {
 	mux.HandleFunc("/v1/messages", s.handleAnthropicMessages)
 	mux.HandleFunc("/v1/messages/count_tokens", s.handleCountTokens)
 
-	addr := fmt.Sprintf("127.0.0.1:%d", cfg.Port)
+	addr := fmt.Sprintf("%s:%d", cfg.Bind, cfg.Port)
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           withMiddleware(mux),
+		Handler:           apiKeyGate(withMiddleware(mux), cfg.APIKey),
 		ReadHeaderTimeout: 15 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
 
 	go func() {
-		logger.Printf("mlai-bridge %s on http://%s  (mlai=%s model=%s concurrency=%d cache=%s)",
-			version, addr, cfg.MLAI, cfg.DefaultModel, cap(s.sem), cfg.CacheTTL)
+		auth := "open"
+		if cfg.APIKey != "" {
+			auth = "bearer key required"
+		}
+		logger.Printf("mlai-bridge %s on http://%s  (mlai=%s model=%s concurrency=%d cache=%s auth=%s)",
+			version, addr, cfg.MLAI, cfg.DefaultModel, cap(s.sem), cfg.CacheTTL, auth)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Fatalf("listen: %v", err)
 		}

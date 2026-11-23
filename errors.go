@@ -21,6 +21,7 @@ func (e apiError) Error() string { return e.Message }
 
 var (
 	errAuth        = apiError{401, "authentication_error", "not_signed_in", "authentication_error", "mlai CLI is not signed in — run `mlai login` on the bridge host"}
+	errBadKey      = apiError{401, "authentication_error", "invalid_api_key", "authentication_error", "missing or invalid API key"}
 	errRate        = apiError{429, "rate_limit_error", "rate_limited", "rate_limit_error", "upstream session limit reached — retry shortly"}
 	errBudget      = apiError{429, "rate_limit_error", "daily_cap", "rate_limit_error", "account allowance or credits exhausted"}
 	errUpgrade     = apiError{400, "invalid_request_error", "upgrade_required", "invalid_request_error", "mlai CLI is out of date — run `mlai update`"}

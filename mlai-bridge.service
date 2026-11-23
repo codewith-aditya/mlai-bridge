@@ -8,7 +8,7 @@ Type=simple
 WorkingDirectory=/root/mlai-bridge
 Environment=HOME=/root
 Environment=PATH=/opt/mlai/node_modules/.bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/root/mlai-bridge/mlai-bridge -port 8197 -workdir /root/mlai-bridge/workspace -model pixis-opus -concurrency 1 -mlai /opt/mlai/node_modules/.bin/mlai
+ExecStart=/root/mlai-bridge/mlai-bridge -port 8197 -workdir /root/mlai-bridge/workspace -model pixis-opus -concurrency 1 -mlai /opt/mlai/node_modules/.bin/mlai -bind 127.0.0.1 -api-key 0b943e9b56e1d088e205371d69fbd9dc0a9d77e5974fcb69
 Restart=always
 RestartSec=5
 StandardOutput=append:/var/log/mlai-bridge.log

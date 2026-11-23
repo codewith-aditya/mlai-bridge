@@ -173,6 +173,45 @@ curl http://127.0.0.1:8197/v1/chat/completions -H 'Content-Type: application/jso
 | `-timeout` | `10m` | wall clock per request |
 | `-cache-ttl` | `10m` | identical-request cache (`0` disables) |
 | `-cache-size` | `512` | cache entries |
+| `-bind` `MLAI_BIND` | `127.0.0.1` | listen address (`0.0.0.0` only with `-api-key` set) |
+| `-api-key` `MLAI_API_KEY` | *empty* | require `Authorization: Bearer <key>` (or `x-api-key`) on `/v1/*`; `/healthz` and `/metrics` stay open |
+| `-direct` `MLAI_DIRECT` | `true` | gateway direct mode; `false` = CLI only |
+
+## Exposing it beyond localhost
+
+Two supported shapes:
+
+**Behind your own reverse proxy (recommended).** Keep the bridge on loopback and add a
+TLS location:
+
+```nginx
+location ^~ /mlai/ {
+    proxy_pass http://127.0.0.1:8197/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_buffering off;         # SSE must not be buffered
+    proxy_cache off;
+    proxy_read_timeout 3600s;
+    client_max_body_size 8m;
+}
+```
+
+Then clients use `https://your.host/mlai/v1`.
+
+**Direct bind.** `-bind 0.0.0.0 -api-key <key>` — only do this with the key set, and prefer
+a firewall allowlist over the open internet.
+
+Generate a key and keep it out of git:
+
+```bash
+openssl rand -hex 24 > .apikey && chmod 600 .apikey
+./mlai-bridge -bind 0.0.0.0 -api-key "$(cat .apikey)"
+```
+
+Auth accepts `Authorization: Bearer <key>`, `x-api-key: <key>`, `api-key: <key>`, or
+`?key=<key>` for GETs. Wrong/missing key returns `401 invalid_api_key` in the provider's
+error shape. CORS preflight is answered for browser clients.
 
 ## Error codes
 
