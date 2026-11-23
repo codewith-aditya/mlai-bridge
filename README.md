@@ -44,6 +44,49 @@ client ─► bridge ─► code.ml.ai/api/model/v1/chat/completions   (direct: 
 Disable it with `-direct=false` to always use the CLI path (slower: ~10–16 s to first
 token, because the CLI buffers the whole answer).
 
+## Models
+
+Ten ids, as reported by the CLI for an Infinite account. Full table (display names, plan,
+aliases): **[docs/MODELS.md](docs/MODELS.md)**.
+
+| Id | What it is | Plan | TTFT / TPS (measured) |
+| --- | --- | --- | --- |
+| `pixis-opus` | Opus 5.5R — strongest, default | **unlimited** | 0.7–7.8 s · 60–135 |
+| `pixis` | Pixis — fast coding | **unlimited** | 1.3 s · ~150 |
+| `pixis-sol` | GPT 6.1R Sol — fast, large context | **unlimited** | 5.5 s · ~70 |
+| `ml-ai-forge` | ML.ai Forge — text only | **unlimited** | 0.8 s · ~170 |
+| `gpt-6-astra` | GPT 6 Astra | credits | 0.7 s · ~150 |
+| `grok-4.7` | Grok 4.7 | credits | — |
+| `mlai-coder` | ML.ai Coder | credits | — |
+| `glm-5.3` | GLM 5.3 — text only | credits | 0.6 s · ~140 |
+| `claude-sonnet-5.5` | Claude Sonnet 5.5 | credits | 0.8 s · ~155 |
+| `claude-fable-5.2` | Claude Fable 5.2 | credits | — |
+
+## Benchmarks
+
+Measured 2026-11-23 through this bridge, streaming, one request at a time (4 vCPU VPS,
+US egress). Method and the CLI-mode comparison: **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**.
+
+| Model | TTFT | Total | Prompt tok | Completion tok | TPS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `glm-5.3` | 0.64 s | 9.33 s | 43 | 1322 | 141.7 |
+| `gpt-6-astra` | 0.66 s | 7.42 s | 43 | 1127 | 151.9 |
+| `claude-sonnet-5.5` | 0.76 s | 8.52 s | 43 | 1334 | 156.5 |
+| `ml-ai-forge` | 0.79 s | 10.57 s | 42 | 1812 | 171.5 |
+| `pixis` | 1.32 s | 9.61 s | 43 | 1434 | 149.2 |
+| `pixis-sol` | 5.47 s | 13.66 s | 43 | 951 | 69.6 |
+| `pixis-opus` | 7.81 s | 15.42 s | 41 | 964 | 62.5 |
+
+The prompt column is the point of direct mode: ~43 tokens instead of the CLI's ~14 700-token
+harness prompt. `pixis-opus` on a warm keeper has measured **0.66–0.94 s TTFT** and
+111–135 TPS; the row above includes a keeper refresh.
+
+## Docs
+
+- [docs/MODELS.md](docs/MODELS.md) — ids, display names, plan, aliases, how to refresh the list
+- [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — methodology, direct vs CLI numbers
+- [CONTRIBUTING.md](CONTRIBUTING.md) — rules, dev loop, how to add a model
+
 ## Requirements
 
 - Go 1.22+ to build
