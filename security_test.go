@@ -635,7 +635,7 @@ func TestNoKeySendsNoCORSHeaders(t *testing.T) {
 func TestOversizedBodiesAreRejected(t *testing.T) {
 	setupStub(t)
 	s := newTestServer(t)
-	big := []byte(`{"messages":[{"role":"user","content":"` + strings.Repeat("a", 8<<20) + `"}]}`)
+	big := []byte(`{"messages":[{"role":"user","content":"` + strings.Repeat("a", 17<<20) + `"}]}`)
 	small := `{"messages":[{"role":"user","content":"hi"}]}`
 	for _, key := range []string{"", testKey} {
 		h := testChain(s, key)
@@ -649,7 +649,7 @@ func TestOversizedBodiesAreRejected(t *testing.T) {
 		for _, method := range []string{"POST", "PUT", "GET"} {
 			rec := serve(h, method, "/v1/messages/count_tokens", "", hdr, bytes.NewReader(big))
 			if rec.Code == 200 || rec.Code < 400 {
-				t.Errorf("key %q: %s with an 8 MiB body = %d, want an error", key, method, rec.Code)
+				t.Errorf("key %q: %s with a 17 MiB body = %d, want an error", key, method, rec.Code)
 			}
 		}
 	}

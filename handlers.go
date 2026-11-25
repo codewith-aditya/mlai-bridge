@@ -15,33 +15,56 @@ import (
 // ---------- shared types ----------
 
 type chatMessage struct {
-	Role    string          `json:"role"`
-	Content json.RawMessage `json:"content"`
+	Role       string          `json:"role"`
+	Content    json.RawMessage `json:"content"`
+	ToolCalls  json.RawMessage `json:"tool_calls,omitempty"`
+	ToolCallID string          `json:"tool_call_id,omitempty"`
+	Name       string          `json:"name,omitempty"`
 }
 
-// text flattens string content or [{type:text,text:...}] parts.
+// text flattens string content or [{type:text,text:...}] parts. Tool calls and
+// results are rendered as bracketed notes for the CLI fallback.
 func (m chatMessage) text() string {
-	if len(m.Content) == 0 {
-		return ""
+	var b strings.Builder
+	note := func(s string) {
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(s)
 	}
-	var s string
-	if json.Unmarshal(m.Content, &s) == nil {
-		return s
-	}
-	var parts []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
-	if json.Unmarshal(m.Content, &parts) == nil {
-		var b strings.Builder
-		for _, p := range parts {
-			if p.Text != "" {
-				b.WriteString(p.Text)
+	if len(m.Content) > 0 {
+		var s string
+		if json.Unmarshal(m.Content, &s) == nil {
+			b.WriteString(s)
+		} else {
+			var parts []anthropicBlock
+			if json.Unmarshal(m.Content, &parts) == nil {
+				for _, p := range parts {
+					switch p.Type {
+					case "tool_use":
+						note("[called tool " + p.Name + " with " + toolArgs(p.Input) + "]")
+					case "tool_result":
+						note("[tool result: " + anthropicText(p.Content) + "]")
+					default:
+						b.WriteString(p.Text)
+					}
+				}
+			} else {
+				b.WriteString(string(m.Content))
 			}
 		}
-		return b.String()
 	}
-	return string(m.Content)
+	if len(m.ToolCalls) > 0 {
+		var calls []struct {
+			Function gwFunction `json:"function"`
+		}
+		if json.Unmarshal(m.ToolCalls, &calls) == nil {
+			for _, c := range calls {
+				note("[called tool " + c.Function.Name + " with " + toolArgs(c.Function.Arguments) + "]")
+			}
+		}
+	}
+	return b.String()
 }
 
 type toolDef struct {
@@ -374,7 +397,7 @@ func (s *server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 				copySSE(w, resp)
 				return true
 			}
-			text, gwModel, usage, err := aggregateGateway(resp)
+			text, gwModel, calls, finish, usage, err := aggregateGateway(resp)
 			if err != nil {
 				logger.Printf("direct aggregate failed: %v", err)
 				return false
@@ -382,13 +405,30 @@ func (s *server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 			if gwModel == "" {
 				gwModel = model
 			}
+			if finish == "" {
+				finish = "stop"
+			}
+			msg := map[string]any{"role": "assistant", "content": text}
+			if len(calls) > 0 {
+				toolCalls := make([]map[string]any, 0, len(calls))
+				for _, c := range calls {
+					toolCalls = append(toolCalls, map[string]any{
+						"id": c.ID, "type": "function",
+						"function": map[string]any{"name": c.Name, "arguments": c.Arguments},
+					})
+				}
+				msg["tool_calls"] = toolCalls
+				if text == "" {
+					msg["content"] = nil
+				}
+			}
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]any{
 				"id": fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()), "object": "chat.completion",
 				"created": time.Now().Unix(), "model": gwModel,
 				"choices": []map[string]any{{
-					"index": 0, "finish_reason": "stop",
-					"message": map[string]any{"role": "assistant", "content": text},
+					"index": 0, "finish_reason": finish,
+					"message": msg,
 				}},
 				"usage": usage,
 			})
@@ -513,6 +553,9 @@ type anthropicRequest struct {
 	Stream    bool            `json:"stream"`
 	Tools     []toolDef       `json:"tools"`
 	Metadata  map[string]any  `json:"metadata"`
+
+	ToolChoice  json.RawMessage `json:"tool_choice"`
+	Temperature *float64        `json:"temperature"`
 }
 
 func (s *server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {

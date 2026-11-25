@@ -19,6 +19,7 @@ test:
 
 install: build
 	install -m 0755 $(BINARY) /usr/local/bin/$(BINARY)
+	ln -sf $(BINARY) /usr/local/bin/ml-wrap
 
 docker:
 	docker build -t mlai-bridge:latest .

@@ -23,8 +23,11 @@ func openAIBodyFromOpenAI(req openAIRequest, model string) []byte {
 	if req.Stream {
 		body["stream_options"] = map[string]any{"include_usage": true}
 	}
-	if len(req.Tools) > 0 {
-		body["tools"] = req.Tools
+	if tools := cleanTools(req.Tools, false); len(tools) > 0 {
+		body["tools"] = tools
+		if tc := strings.TrimSpace(string(req.ToolChoice)); tc != "" && tc != "null" {
+			body["tool_choice"] = req.ToolChoice
+		}
 	}
 	if cfg.Effort != "" {
 		body["reasoning_effort"] = cfg.Effort
@@ -43,17 +46,11 @@ func openAIBodyFromOpenAI(req openAIRequest, model string) []byte {
 func openAIBodyFromAnthropic(req anthropicRequest, model string) []byte {
 	msgs := make([]map[string]any, 0, len(req.Messages)+1)
 	if len(req.System) > 0 {
-		var s string
-		if json.Unmarshal(req.System, &s) != nil {
-			s = string(req.System)
-		}
-		if strings.TrimSpace(s) != "" {
+		if s := anthropicText(req.System); strings.TrimSpace(s) != "" {
 			msgs = append(msgs, map[string]any{"role": "system", "content": s})
 		}
 	}
-	for _, m := range req.Messages {
-		msgs = append(msgs, map[string]any{"role": m.Role, "content": m.text()})
-	}
+	msgs = append(msgs, anthropicMessages(req.Messages)...)
 	body := map[string]any{
 		"model":    model,
 		"messages": msgs,
@@ -62,8 +59,17 @@ func openAIBodyFromAnthropic(req anthropicRequest, model string) []byte {
 	if req.Stream {
 		body["stream_options"] = map[string]any{"include_usage": true}
 	}
+	if tools := cleanTools(req.Tools, true); len(tools) > 0 {
+		body["tools"] = tools
+		if tc := anthropicToolChoice(req.ToolChoice); tc != nil {
+			body["tool_choice"] = tc
+		}
+	}
 	if req.MaxTokens > 0 {
 		body["max_tokens"] = req.MaxTokens
+	}
+	if req.Temperature != nil {
+		body["temperature"] = *req.Temperature
 	}
 	if cfg.Effort != "" {
 		body["reasoning_effort"] = cfg.Effort
@@ -96,26 +102,26 @@ func copySSE(w http.ResponseWriter, resp *http.Response) {
 	}
 }
 
-// aggregateGateway reads a non-stream gateway response and returns text + usage.
-func aggregateGateway(resp *http.Response) (text, model string, usage map[string]any, err error) {
+// aggregateGateway reads a non-stream gateway response and returns text, tool
+// calls, finish reason and usage.
+func aggregateGateway(resp *http.Response) (text, model string, toolCalls []gwToolCall, finish string, usage map[string]any, err error) {
 	defer resp.Body.Close()
-	var doc struct {
-		Model   string `json:"model"`
-		Choices []struct {
-			Message struct {
-				Content          string `json:"content"`
-				ReasoningContent string `json:"reasoning_content"`
-			} `json:"message"`
-		} `json:"choices"`
-		Usage map[string]any `json:"usage"`
-	}
+	var doc gwFullDoc
 	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
-		return "", "", nil, err
+		return "", "", nil, "", nil, err
 	}
 	if len(doc.Choices) == 0 {
-		return "", doc.Model, doc.Usage, fmt.Errorf("gateway returned no choices")
+		return "", doc.Model, nil, "", doc.Usage, fmt.Errorf("gateway returned no choices")
 	}
-	return doc.Choices[0].Message.Content, doc.Model, doc.Usage, nil
+	ch := doc.Choices[0]
+	for i, tc := range ch.Message.ToolCalls {
+		callID := tc.ID
+		if callID == "" {
+			callID = fmt.Sprintf("call_%d_%d", time.Now().UnixNano(), i)
+		}
+		toolCalls = append(toolCalls, gwToolCall{ID: callID, Name: tc.Function.Name, Arguments: toolArgs(tc.Function.Arguments)})
+	}
+	return ch.Message.Content, doc.Model, toolCalls, ch.FinishReason, doc.Usage, nil
 }
 
 // streamToAnthropic translates the gateway's OpenAI SSE into Anthropic events.
@@ -135,6 +141,18 @@ func streamToAnthropic(w http.ResponseWriter, resp *http.Response, model string)
 	id := fmt.Sprintf("msg_%d", time.Now().UnixNano())
 	started := false
 	usage := map[string]any{}
+	finish := ""
+	// next: index of the next content block; textIdx: open text block or -1;
+	// tools: tool calls in first-seen order; byIdx: latest tool call per upstream
+	// index; cur: tool call whose block is open; pending: text that arrived once a
+	// tool call had begun.
+	next := 0
+	textIdx := -1
+	produced := false
+	var tools []*streamTool
+	byIdx := map[int]*streamTool{}
+	var cur *streamTool
+	var pending strings.Builder
 	start := func() {
 		if started {
 			return
@@ -148,10 +166,73 @@ func streamToAnthropic(w http.ResponseWriter, resp *http.Response, model string)
 				"usage": map[string]any{"input_tokens": 0, "output_tokens": 0},
 			},
 		})
-		send("content_block_start", map[string]any{
-			"type": "content_block_start", "index": 0,
-			"content_block": map[string]any{"type": "text", "text": ""},
-		})
+	}
+	openBlock := func(block map[string]any) int {
+		start()
+		i := next
+		next++
+		produced = true
+		send("content_block_start", map[string]any{"type": "content_block_start", "index": i, "content_block": block})
+		return i
+	}
+	closeBlock := func(i int) {
+		send("content_block_stop", map[string]any{"type": "content_block_stop", "index": i})
+	}
+	delta := func(i int, d map[string]any) {
+		send("content_block_delta", map[string]any{"type": "content_block_delta", "index": i, "delta": d})
+	}
+	writeText := func(s string) {
+		if textIdx < 0 {
+			textIdx = openBlock(map[string]any{"type": "text", "text": ""})
+		}
+		delta(textIdx, map[string]any{"type": "text_delta", "text": s})
+	}
+	closeText := func() {
+		if textIdx >= 0 {
+			closeBlock(textIdx)
+			textIdx = -1
+		}
+	}
+	// pump emits tool_use blocks one at a time. The open tool call ends once its
+	// arguments form valid JSON (or at end of stream); later tool calls stay
+	// buffered until then.
+	pump := func(final bool) {
+		for {
+			if cur != nil {
+				if args := cur.args.String(); cur.sent < len(args) {
+					delta(cur.index, map[string]any{"type": "input_json_delta", "partial_json": args[cur.sent:]})
+					cur.sent = len(args)
+				}
+				if args := cur.args.String(); !final && (!strings.HasSuffix(args, "}") || !json.Valid([]byte(args))) {
+					return
+				}
+				if cur.sent == 0 {
+					delta(cur.index, map[string]any{"type": "input_json_delta", "partial_json": "{}"})
+				}
+				closeBlock(cur.index)
+				cur = nil
+			}
+			var nxt *streamTool
+			for _, t := range tools {
+				if !t.opened {
+					nxt = t
+					break
+				}
+			}
+			if nxt == nil || (!final && nxt.name == "") {
+				return
+			}
+			closeText()
+			if nxt.id == "" {
+				nxt.id = fmt.Sprintf("toolu_%d_%d", time.Now().UnixNano(), next)
+			}
+			nxt.opened = true
+			nxt.index = openBlock(map[string]any{"type": "tool_use", "id": nxt.id, "name": nxt.name, "input": map[string]any{}})
+			cur = nxt
+		}
+	}
+	fail := func(msg string) {
+		send("error", map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": msg}})
 	}
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 1<<20), 4<<20)
@@ -164,19 +245,13 @@ func streamToAnthropic(w http.ResponseWriter, resp *http.Response, model string)
 		if payload == "" || payload == "[DONE]" {
 			continue
 		}
-		var ev struct {
-			Model   string `json:"model"`
-			Choices []struct {
-				Delta struct {
-					Content          string `json:"content"`
-					ReasoningContent string `json:"reasoning_content"`
-				} `json:"delta"`
-				FinishReason any `json:"finish_reason"`
-			} `json:"choices"`
-			Usage map[string]any `json:"usage"`
-		}
+		var ev gwChunk
 		if json.Unmarshal([]byte(payload), &ev) != nil {
 			continue
+		}
+		if len(ev.Error) > 0 && string(ev.Error) != "null" {
+			fail(gwErrorMessage(ev.Error))
+			return
 		}
 		if ev.Model != "" {
 			model = ev.Model
@@ -186,21 +261,51 @@ func streamToAnthropic(w http.ResponseWriter, resp *http.Response, model string)
 		}
 		text := ""
 		for _, ch := range ev.Choices {
-			if ch.Delta.Content != "" {
-				text += ch.Delta.Content
+			text += ch.Delta.Content
+			if ch.FinishReason != "" {
+				finish = ch.FinishReason
+			}
+			for _, tc := range ch.Delta.ToolCalls {
+				t := byIdx[tc.Index]
+				if t == nil || (tc.ID != "" && t.id != "" && tc.ID != t.id) {
+					t = &streamTool{}
+					byIdx[tc.Index] = t
+					tools = append(tools, t)
+				}
+				if tc.ID != "" {
+					t.id = tc.ID
+				}
+				if t.name == "" {
+					t.name = tc.Function.Name
+				}
+				t.args.WriteString(rawString(tc.Function.Arguments))
 			}
 		}
-		if text == "" {
-			continue
+		if text != "" {
+			if len(tools) > 0 {
+				pending.WriteString(text)
+			} else {
+				writeText(text)
+			}
 		}
-		start()
-		send("content_block_delta", map[string]any{
-			"type": "content_block_delta", "index": 0,
-			"delta": map[string]any{"type": "text_delta", "text": text},
-		})
+		pump(false)
 	}
-	start()
-	send("content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
+	if err := sc.Err(); err != nil {
+		fail(err.Error())
+		return
+	}
+	if finish == "" { // cut off: a half-written tool call must not look complete
+		fail("the gateway stream ended early")
+		return
+	}
+	pump(true)
+	if pending.Len() > 0 {
+		writeText(pending.String())
+	}
+	closeText()
+	if !produced {
+		closeBlock(openBlock(map[string]any{"type": "text", "text": ""}))
+	}
 	in := toInt(usage["prompt_tokens"])
 	out := toInt(usage["completion_tokens"])
 	cached := 0
@@ -209,12 +314,10 @@ func streamToAnthropic(w http.ResponseWriter, resp *http.Response, model string)
 	}
 	send("message_delta", map[string]any{
 		"type":  "message_delta",
-		"delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil},
-		"usage": map[string]any{"output_tokens": out},
+		"delta": map[string]any{"stop_reason": anthropicStopReason(finish, len(tools) > 0), "stop_sequence": nil},
+		"usage": map[string]any{"input_tokens": in, "output_tokens": out, "cache_read_input_tokens": cached},
 	})
 	send("message_stop", map[string]any{"type": "message_stop"})
-	_ = in
-	_ = cached
 }
 
 func toInt(v any) int {
@@ -232,7 +335,7 @@ func toInt(v any) int {
 
 // anthropicFromGateway handles a non-stream Anthropic request via the gateway.
 func anthropicFromGateway(w http.ResponseWriter, resp *http.Response, model string) {
-	text, gwModel, usage, err := aggregateGateway(resp)
+	text, gwModel, calls, finish, usage, err := aggregateGateway(resp)
 	if err != nil {
 		writeAnthropicError(w, errUpstream, w.Header().Get("X-Request-Id"))
 		return
@@ -246,12 +349,23 @@ func anthropicFromGateway(w http.ResponseWriter, resp *http.Response, model stri
 	if d, ok := usage["prompt_tokens_details"].(map[string]any); ok {
 		cached = toInt(d["cached_tokens"])
 	}
+	content := make([]map[string]any, 0, len(calls)+1)
+	if text != "" || len(calls) == 0 {
+		content = append(content, map[string]any{"type": "text", "text": text})
+	}
+	for _, c := range calls {
+		var input map[string]any
+		if json.Unmarshal([]byte(c.Arguments), &input) != nil || input == nil {
+			input = map[string]any{}
+		}
+		content = append(content, map[string]any{"type": "tool_use", "id": c.ID, "name": c.Name, "input": input})
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"id": fmt.Sprintf("msg_%d", time.Now().UnixNano()), "type": "message",
 		"role": "assistant", "model": model,
-		"content":     []map[string]any{{"type": "text", "text": text}},
-		"stop_reason": "end_turn", "stop_sequence": nil,
+		"content":     content,
+		"stop_reason": anthropicStopReason(finish, len(calls) > 0), "stop_sequence": nil,
 		"usage": map[string]any{"input_tokens": in, "output_tokens": out, "cache_read_input_tokens": cached},
 	})
 }

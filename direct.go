@@ -37,6 +37,9 @@ const tokenTTL = 80 * time.Minute
 // doubles with every failure in a row (up to 32x).
 var keeperCooldown = 60 * time.Second
 
+// closeWait bounds how long Close waits for a keeper run that is being opened.
+var closeWait = 15 * time.Second
+
 // gatewayClient never follows redirects: the run token must not leave the gateway.
 var gatewayClient = &http.Client{
 	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
@@ -255,8 +258,8 @@ func (k *runKeeper) runRefresh(done chan struct{}) {
 	k.lastErr = err
 	k.refresh = nil
 	k.mu.Unlock()
-	close(done)
 	k.stop(orphan)
+	close(done)
 }
 
 // spawn starts a keeper run and waits for its token to appear.
@@ -312,8 +315,15 @@ func (k *runKeeper) Close() {
 	k.closed = true
 	id := k.session
 	k.session, k.token = "", ""
+	refresh := k.refresh
 	k.mu.Unlock()
 	k.stop(id)
+	if refresh != nil { // a run is being opened: give it time to appear so it gets stopped
+		select {
+		case <-refresh:
+		case <-time.After(closeWait):
+		}
+	}
 }
 
 // directRequest posts an OpenAI-shaped body to the gateway with the run token.

@@ -17,6 +17,7 @@ can talk to it.
 - `POST /v1/chat/completions` — OpenAI Chat Completions (stream + non-stream), tool calls
 - `POST /v1/messages` — Anthropic Messages (stream + non-stream), `tool_use` blocks
 - `POST /v1/messages/count_tokens` — token estimate
+- `POST /v1/responses` (Codex; stateless)
 - `GET /v1/models`, `GET /healthz` (status, version, `uptime_s`, `signed_in`; sign-in state
   is cached for 60 s), `GET /metrics`
 - **Direct mode** (default): talks to `code.ml.ai/api/model/v1/chat/completions` with a
@@ -155,6 +156,38 @@ Key points of the unit:
   purpose: Node needs JIT and the CLI sandbox needs namespaces.
 - Logs go to the journal: `journalctl -u mlai-bridge`.
 
+## Run Claude Code or Codex through the bridge
+
+```bash
+ml-wrap claude                          # default model
+ml-wrap claude -m pixis -- -p "fix the failing test"
+ml-wrap codex -m pixis-sol
+ml-wrap codex -- exec "explain this repo"
+ml-wrap claude --dry-run                # show the command and variable names only
+```
+
+`ml-wrap` is the same binary (`make install` links it); `mlai-bridge claude` works too. On
+Windows copy `mlai-bridge.exe` to `ml-wrap.exe`. The launcher starts a private bridge on
+`127.0.0.1` with a random key, runs the client with it and stops the bridge when the client
+exits (log: `~/mlai-bridge/wrap.log`). It sets variables (and `-c` options for Codex) for that
+process only: no Claude Code or Codex file is changed. Use `--url` or `MLAI_BRIDGE_URL`, with
+the key in `MLAI_API_KEY`, for a bridge that is already running.
+
+| Command | What it does |
+| --- | --- |
+| `serve` | run the bridge (also the default without a command) |
+| `claude`, `codex` | start the client against a bridge; arguments after `--` go to the client |
+| `env <claude\|codex>` | print the variables for a running bridge (`--powershell` on Windows) |
+| `models`, `status` | models and health of a running bridge |
+| `doctor` | check `mlai`, `claude`, `codex` and the sign-in |
+| `version`, `help` | |
+
+Limits: an `env` block in `~/.claude/settings.json` overrides these variables. Codex shows a
+"model metadata not found" warning and Claude Code an "unrecognized model" one; both continue.
+Agent requests are larger than the 30,000 characters the CLI accepts, so these clients need
+direct mode: the CLI fallback only helps for short prompts. Server-side tools such as web
+search are not available.
+
 ## Client setup
 
 OpenAI SDK / any compatible client:
@@ -278,6 +311,9 @@ Stream: a final chunk with `"choices": []` and the same `usage` object, then `[D
 Anthropic: `usage.input_tokens`, `usage.output_tokens`, `usage.cache_read_input_tokens`.
 
 ## Tool calls
+
+Direct mode passes tools and tool results to the gateway and returns its tool calls as they
+are. The rest of this section is about the CLI path.
 
 The CLI has no native function-calling channel, so the bridge emulates it: tool
 definitions are injected into the prompt and the model is asked to answer with

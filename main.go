@@ -54,23 +54,25 @@ var (
 	startedAt      = time.Now()
 )
 
-func initFlags() {
-	flag.IntVar(&cfg.Port, "port", envInt("MLAI_PORT", 8197), "listen port (127.0.0.1)")
-	flag.StringVar(&cfg.MLAI, "mlai", envStr("MLAI_BIN", "mlai"), "path to the mlai CLI")
-	flag.StringVar(&cfg.WorkDir, "workdir", envStr("MLAI_WORKDIR", defaultWorkDir()), "folder the agent runs in")
-	flag.StringVar(&cfg.DefaultModel, "model", envStr("MLAI_MODEL", "pixis-opus"), "default model id")
-	flag.IntVar(&cfg.Concurrency, "concurrency", envInt("MLAI_CONCURRENCY", 1), "max parallel CLI runs")
-	flag.IntVar(&cfg.DirectConcurrency, "direct-concurrency", envInt("MLAI_DIRECT_CONCURRENCY", 8), "max parallel gateway requests")
-	flag.DurationVar(&cfg.QueueWait, "queue-wait", 30*time.Second, "how long a request waits for a free slot")
-	flag.DurationVar(&cfg.Timeout, "timeout", 10*time.Minute, "per-request wall clock limit")
-	flag.DurationVar(&cfg.CacheTTL, "cache-ttl", 10*time.Minute, "identical-request cache TTL (0 disables)")
-	flag.IntVar(&cfg.CacheSize, "cache-size", 512, "cache entries")
-	flag.StringVar(&cfg.Effort, "effort", envStr("MLAI_EFFORT", ""), "reasoning effort: low|medium|high|max")
-	flag.BoolVar(&cfg.Direct, "direct", envBool("MLAI_DIRECT", true), "talk to the gateway directly (real token streaming) with CLI fallback")
-	flag.StringVar(&cfg.Bind, "bind", envStr("MLAI_BIND", "127.0.0.1"), "listen address (0.0.0.0 to expose; requires an API key)")
+// initFlags fills cfg from args (without the program name) and the environment.
+func initFlags(args []string) {
+	fs := flag.NewFlagSet("mlai-bridge", flag.ExitOnError)
+	fs.IntVar(&cfg.Port, "port", envInt("MLAI_PORT", 8197), "listen port (127.0.0.1)")
+	fs.StringVar(&cfg.MLAI, "mlai", envStr("MLAI_BIN", "mlai"), "path to the mlai CLI")
+	fs.StringVar(&cfg.WorkDir, "workdir", envStr("MLAI_WORKDIR", defaultWorkDir()), "folder the agent runs in")
+	fs.StringVar(&cfg.DefaultModel, "model", envStr("MLAI_MODEL", "pixis-opus"), "default model id")
+	fs.IntVar(&cfg.Concurrency, "concurrency", envInt("MLAI_CONCURRENCY", 1), "max parallel CLI runs")
+	fs.IntVar(&cfg.DirectConcurrency, "direct-concurrency", envInt("MLAI_DIRECT_CONCURRENCY", 8), "max parallel gateway requests")
+	fs.DurationVar(&cfg.QueueWait, "queue-wait", 30*time.Second, "how long a request waits for a free slot")
+	fs.DurationVar(&cfg.Timeout, "timeout", 10*time.Minute, "per-request wall clock limit")
+	fs.DurationVar(&cfg.CacheTTL, "cache-ttl", 10*time.Minute, "identical-request cache TTL (0 disables)")
+	fs.IntVar(&cfg.CacheSize, "cache-size", 512, "cache entries")
+	fs.StringVar(&cfg.Effort, "effort", envStr("MLAI_EFFORT", ""), "reasoning effort: low|medium|high|max")
+	fs.BoolVar(&cfg.Direct, "direct", envBool("MLAI_DIRECT", true), "talk to the gateway directly (real token streaming) with CLI fallback")
+	fs.StringVar(&cfg.Bind, "bind", envStr("MLAI_BIND", "127.0.0.1"), "listen address (0.0.0.0 to expose; requires an API key)")
 	// The env default is applied after Parse so `-h` never prints the key.
-	flag.StringVar(&cfg.APIKey, "api-key", "", "require this bearer key on /v1/* (env MLAI_API_KEY; empty = open, loopback only)")
-	flag.Parse()
+	fs.StringVar(&cfg.APIKey, "api-key", "", "require this bearer key on /v1/* (env MLAI_API_KEY; empty = open, loopback only)")
+	fs.Parse(args)
 	cfg.Bind = strings.Trim(cfg.Bind, "[]")
 	cfg.APIKey = strings.TrimSpace(cfg.APIKey)
 	if cfg.APIKey == "" {
@@ -138,6 +140,9 @@ type server struct {
 	directSem chan struct{}
 	keeper    *runKeeper
 	direct    bool
+
+	// cancelBase ends the base context of the http.Server built by newHTTPServer.
+	cancelBase context.CancelFunc
 
 	healthMu sync.Mutex
 	healthAt time.Time
@@ -233,7 +238,7 @@ func withMiddleware(next http.Handler) http.Handler {
 			id = fmt.Sprintf("req_%d", time.Now().UnixNano())
 		}
 		w.Header().Set("X-Request-Id", id)
-		r.Body = http.MaxBytesReader(w, r.Body, 2<<20)
+		r.Body = http.MaxBytesReader(w, r.Body, 16<<20)
 		t0 := time.Now()
 		next.ServeHTTP(w, r)
 		logger.Printf("%s %q %q %s", id, r.Method, r.URL.Path, time.Since(t0).Round(time.Millisecond))
@@ -267,33 +272,72 @@ func decodeBody(w http.ResponseWriter, r *http.Request, v any) error {
 	return json.Unmarshal(raw, v)
 }
 
-func main() {
-	initFlags()
-	if err := validateConfig(cfg); err != nil {
-		logger.Fatal(err)
-	}
-	s := newServer()
-
+// newHTTPServer builds the mux and middleware chain from cfg. The caller
+// starts it and stops it with s.shutdown.
+func newHTTPServer(s *server) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/chat/completions", s.handleOpenAIChat)
+	mux.HandleFunc("/v1/responses", s.handleResponses)
 	mux.HandleFunc("/v1/messages", s.handleAnthropicMessages)
 	mux.HandleFunc("/v1/messages/count_tokens", s.handleCountTokens)
 
-	addr := net.JoinHostPort(cfg.Bind, strconv.Itoa(cfg.Port))
 	base, cancelBase := context.WithCancel(context.Background())
-	defer cancelBase()
-	srv := &http.Server{
+	s.cancelBase = cancelBase
+	return &http.Server{
 		BaseContext:       func(net.Listener) context.Context { return base },
-		Addr:              addr,
+		Addr:              net.JoinHostPort(cfg.Bind, strconv.Itoa(cfg.Port)),
 		Handler:           withBodyDeadline(withMiddleware(apiKeyGate(mux, cfg.APIKey))),
 		ReadHeaderTimeout: 15 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    64 << 10,
 	}
+}
+
+// shutdown stops srv gracefully, cancels CLI runs that outlive the grace
+// period, and closes the run keeper.
+func (s *server) shutdown(srv *http.Server) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if srv.Shutdown(ctx) != nil {
+		if s.cancelBase != nil {
+			s.cancelBase() // kill CLI runs that outlived the grace period, then let handlers return
+		}
+		ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel2()
+		srv.Shutdown(ctx2)
+	}
+	s.keeper.Close()
+}
+
+func main() {
+	args := os.Args[1:]
+	if len(args) == 0 && strings.HasPrefix(binaryName(os.Args[0]), "ml-wrap") {
+		printHelp(os.Stdout)
+		return
+	}
+	if len(args) == 0 || (strings.HasPrefix(args[0], "-") && !isHelpFlag(args[0])) {
+		serveMain(args)
+		return
+	}
+	if args[0] == "serve" {
+		serveMain(args[1:])
+		return
+	}
+	os.Exit(runCLI(args, os.Stdout, os.Stderr))
+}
+
+// serveMain runs the bridge until SIGINT or SIGTERM.
+func serveMain(args []string) {
+	initFlags(args)
+	if err := validateConfig(cfg); err != nil {
+		logger.Fatal(err)
+	}
+	s := newServer()
+	srv := newHTTPServer(s)
 
 	go func() {
 		auth := "open"
@@ -301,7 +345,7 @@ func main() {
 			auth = "bearer key required"
 		}
 		logger.Printf("mlai-bridge %s on http://%s  (mlai=%s model=%s concurrency=%d cache=%s auth=%s)",
-			version, addr, cfg.MLAI, cfg.DefaultModel, cap(s.sem), cfg.CacheTTL, auth)
+			version, srv.Addr, cfg.MLAI, cfg.DefaultModel, cap(s.sem), cfg.CacheTTL, auth)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Fatalf("listen: %v", err)
 		}
@@ -311,13 +355,5 @@ func main() {
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
 	logger.Print("shutting down")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if srv.Shutdown(ctx) != nil {
-		cancelBase() // kill CLI runs that outlived the grace period, then let handlers return
-		ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel2()
-		srv.Shutdown(ctx2)
-	}
-	s.keeper.Close()
+	s.shutdown(srv)
 }
