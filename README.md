@@ -17,7 +17,8 @@ can talk to it.
 - `POST /v1/chat/completions` — OpenAI Chat Completions (stream + non-stream), tool calls
 - `POST /v1/messages` — Anthropic Messages (stream + non-stream), `tool_use` blocks
 - `POST /v1/messages/count_tokens` — token estimate
-- `GET /v1/models`, `GET /healthz`, `GET /metrics`
+- `GET /v1/models`, `GET /healthz` (status, version, `uptime_s`, `signed_in`; sign-in state
+  is cached for 60 s), `GET /metrics`
 - **Direct mode** (default): talks to `code.ml.ai/api/model/v1/chat/completions` with a
   live run token, so streams are real token deltas (TTFT < 1 s, ~110–160 tok/s) with no
   agent-harness prompt. Falls back to the CLI automatically if the gateway rejects the run.
@@ -35,6 +36,11 @@ dies when the run ends. The bridge therefore keeps **one background CLI run aliv
 (`mlai --bg -y "Run the shell command \`sleep 5400\`…"` in `<workdir>/.keeper`) and reuses
 that run's token from `~/.mlai/sessions/<id>/engine/mcp.json`. When the gateway answers
 `409 run_finished`, the bridge opens a fresh keeper run and retries the request once.
+Keepers start one at a time, at least 60 s apart (longer after repeated failures), and a keeper
+whose token the gateway rejected is stopped before a new one starts.
+
+Direct requests are limited by `-direct-concurrency` (default 8) and by `-timeout`, the same
+wall-clock limit the CLI path uses.
 
 ```
 client ─► bridge ─► code.ml.ai/api/model/v1/chat/completions   (direct: real SSE)
@@ -89,7 +95,7 @@ harness prompt. `pixis-opus` on a warm keeper has measured **0.66–0.94 s TTFT*
 
 ## Requirements
 
-- Go 1.22+ to build
+- Go 1.26+ to build
 - Node.js 20+ and the ML AI Code CLI on the host, signed in once: `mlai login`
 - A plan that covers the models you call (Infinite covers Pixis/Forge without a meter)
 
@@ -114,26 +120,40 @@ ssh -L <port>:127.0.0.1:<port> user@host   # keep this open
 ## Run
 
 ```bash
-./mlai-bridge                       # 127.0.0.1:8197
+./mlai-bridge                       # 127.0.0.1:8197, no key needed
 ./mlai-bridge -port 8197 -model pixis-opus -concurrency 2 -cache-ttl 15m
 ```
 
+Without a key the bridge only starts on a loopback address, only accepts requests whose
+`Host` header is `localhost` or a loopback IP (otherwise `403 forbidden_host`), and requires
+`Content-Type: application/json` on every POST (otherwise `415 unsupported_media_type`).
+
 ### Systemd
 
-```ini
-[Unit]
-Description=mlai-bridge
-After=network-online.target
+The repo ships a hardened unit, `mlai-bridge.service`. It runs as a dedicated `mlai` user
+with state in `/var/lib/mlai-bridge` and reads the key from an environment file instead of
+the command line.
 
-[Service]
-ExecStart=/opt/mlai-bridge/mlai-bridge -port 8197 -workdir /var/lib/mlai-bridge/workspace
-Environment=MLAI_MODEL=pixis-opus
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
+```bash
+sudo useradd --system --home-dir /var/lib/mlai-bridge --shell /usr/sbin/nologin mlai
+sudo install -d -m 0755 /etc/mlai-bridge
+sudo install -m 0600 -o root -g root /dev/null /etc/mlai-bridge/env
+echo "MLAI_API_KEY=$(openssl rand -hex 24)" | sudo tee /etc/mlai-bridge/env >/dev/null
+sudo npm install --prefix /opt/mlai mlai-code
+sudo install -D -m 0755 mlai-bridge /opt/mlai-bridge/mlai-bridge
+sudo install -m 0644 mlai-bridge.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now mlai-bridge
 ```
+
+Key points of the unit:
+
+- `EnvironmentFile=/etc/mlai-bridge/env` (root:root, `0600`) holds `MLAI_API_KEY=...`.
+- `User=mlai`, `StateDirectory=mlai-bridge` (`0700`), `HOME=/var/lib/mlai-bridge`, `UMask=0077`.
+  Run `mlai login` as that user (with the same `HOME`) once, so `~/.mlai` lives there.
+- `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `PrivateDevices`, no capabilities,
+  `NoNewPrivileges`. `MemoryDenyWriteExecute` and `RestrictNamespaces` are left off on
+  purpose: Node needs JIT and the CLI sandbox needs namespaces.
+- Logs go to the journal: `journalctl -u mlai-bridge`.
 
 ## Client setup
 
@@ -141,7 +161,7 @@ OpenAI SDK / any compatible client:
 
 ```
 base_url = http://127.0.0.1:8197/v1
-api_key  = anything (the bridge is local; put it behind your own proxy for remote use)
+api_key  = anything when no key is set on the bridge; otherwise the bridge's MLAI_API_KEY
 model    = pixis-opus
 ```
 
@@ -149,7 +169,7 @@ Claude Code / Anthropic clients:
 
 ```
 ANTHROPIC_BASE_URL = http://127.0.0.1:8197
-ANTHROPIC_API_KEY  = anything
+ANTHROPIC_API_KEY  = anything when no key is set on the bridge; otherwise the bridge's MLAI_API_KEY
 ```
 
 ```bash
@@ -163,26 +183,32 @@ curl http://127.0.0.1:8197/v1/chat/completions -H 'Content-Type: application/jso
 
 | Flag / env | Default | Meaning |
 | --- | --- | --- |
-| `-port` `MLAI_PORT` | `8197` | listen port, loopback only |
+| `-port` `MLAI_PORT` | `8197` | listen port |
 | `-mlai` `MLAI_BIN` | `mlai` | CLI path |
-| `-workdir` `MLAI_WORKDIR` | `/root/mlai-bridge/workspace` | folder the agent runs in |
+| `-workdir` `MLAI_WORKDIR` | `~/mlai-bridge/workspace` | folder the agent runs in |
 | `-model` `MLAI_MODEL` | `pixis-opus` | default model |
 | `-effort` `MLAI_EFFORT` | *empty* | `low\|medium\|high\|max` |
 | `-concurrency` `MLAI_CONCURRENCY` | `1` | parallel CLI runs |
+| `-direct-concurrency` `MLAI_DIRECT_CONCURRENCY` | `8` | parallel direct-mode requests |
 | `-queue-wait` | `30s` | how long a request waits for a slot |
-| `-timeout` | `10m` | wall clock per request |
+| `-timeout` | `10m` | wall clock per request, CLI and direct |
 | `-cache-ttl` | `10m` | identical-request cache (`0` disables) |
 | `-cache-size` | `512` | cache entries |
-| `-bind` `MLAI_BIND` | `127.0.0.1` | listen address (`0.0.0.0` only with `-api-key` set) |
-| `-api-key` `MLAI_API_KEY` | *empty* | require `Authorization: Bearer <key>` (or `x-api-key`) on `/v1/*`; `/healthz` and `/metrics` stay open |
+| `-bind` `MLAI_BIND` | `127.0.0.1` | listen address; a non-loopback address requires `MLAI_API_KEY` (or `-api-key`), otherwise the bridge refuses to start |
+| `-api-key` `MLAI_API_KEY` | *empty* | require `Authorization: Bearer <key>` (or `x-api-key`, `api-key`) on `/v1/*`; `/healthz` and `/metrics` stay open. Prefer the env var: `-api-key` is visible in process lists |
 | `-direct` `MLAI_DIRECT` | `true` | gateway direct mode; `false` = CLI only |
 
 ## Exposing it beyond localhost
 
-Two supported shapes:
+Both shapes below need a key. Without one the bridge only binds to loopback, rejects any
+`Host` header that is not `localhost` or a loopback IP, and requires
+`Content-Type: application/json` on POST. A reverse proxy forwards a public `Host`, so
+without a key every proxied request would fail with `403 forbidden_host`, and a bridge that
+accepted it unauthenticated would be open to anyone who can reach the proxy. Set
+`MLAI_API_KEY` on the bridge and have clients send it.
 
-**Behind your own reverse proxy (recommended).** Keep the bridge on loopback and add a
-TLS location:
+**Behind your own reverse proxy (recommended).** Keep the bridge on loopback with
+`MLAI_API_KEY` set and add a TLS location:
 
 ```nginx
 location ^~ /mlai/ {
@@ -197,21 +223,22 @@ location ^~ /mlai/ {
 }
 ```
 
-Then clients use `https://your.host/mlai/v1`.
+Then clients use `https://your.host/mlai/v1` with the key.
 
-**Direct bind.** `-bind 0.0.0.0 -api-key <key>` — only do this with the key set, and prefer
-a firewall allowlist over the open internet.
+**Direct bind.** `MLAI_API_KEY=<key> ./mlai-bridge -bind 0.0.0.0` — the bridge refuses to
+start on a non-loopback address without a key. Prefer a firewall allowlist over the open
+internet.
 
-Generate a key and keep it out of git:
+Generate a key and keep it out of git. Pass it through the environment, not `-api-key`,
+which shows up in process lists:
 
 ```bash
-openssl rand -hex 24 > .apikey && chmod 600 .apikey
-./mlai-bridge -bind 0.0.0.0 -api-key "$(cat .apikey)"
+(umask 077 && openssl rand -hex 24 > .apikey)
+MLAI_API_KEY="$(cat .apikey)" ./mlai-bridge -bind 0.0.0.0
 ```
 
-Auth accepts `Authorization: Bearer <key>`, `x-api-key: <key>`, `api-key: <key>`, or
-`?key=<key>` for GETs. Wrong/missing key returns `401 invalid_api_key` in the provider's
-error shape. CORS preflight is answered for browser clients.
+Auth accepts `Authorization: Bearer <key>`, `x-api-key: <key>` or `api-key: <key>`.
+A key in the query string is not accepted. Wrong/missing key returns `401 invalid_api_key` in the provider's error shape. CORS preflight is answered for browser clients.
 
 ## Error codes
 
@@ -222,7 +249,9 @@ Errors are returned in the provider's native shape with a stable code:
 | 400 | `invalid_request` | malformed JSON, missing `messages` |
 | 400 | `upgrade_required` | CLI too old (`mlai update`) |
 | 401 | `not_signed_in` | `mlai login` missing/expired |
+| 403 | `forbidden_host` | no key set and the `Host` header is not `localhost` or a loopback IP |
 | 404 | `model_not_found` | unknown model id |
+| 415 | `unsupported_media_type` | POST without `Content-Type: application/json` (enforced when no key is set) |
 | 429 | `concurrent` | no free slot within `-queue-wait` |
 | 429 | `rate_limited` | upstream session/hourly ceiling |
 | 429 | `daily_cap` | allowance/credits exhausted |
@@ -231,6 +260,9 @@ Errors are returned in the provider's native shape with a stable code:
 | 504 | `timeout` | request exceeded `-timeout` |
 
 `429` responses carry `Retry-After`; every response carries `X-Request-Id`.
+
+Error messages sent to clients are fixed text. Raw CLI output appears only in the bridge
+logs.
 
 ## Token accounting
 
@@ -251,18 +283,21 @@ The CLI has no native function-calling channel, so the bridge emulates it: tool
 definitions are injected into the prompt and the model is asked to answer with
 `{"tool_calls":[{"name":"…","arguments":{…}}]}`. The bridge parses that into OpenAI
 `tool_calls` (`finish_reason: "tool_calls"`) or Anthropic `tool_use` blocks
-(`stop_reason: "tool_use"`). It works in practice; it is not a wire-level guarantee, so
-validate arguments on your side.
+(`stop_reason: "tool_use"`). Only tools the request declared are accepted; a call to any
+other name is not turned into a tool call. It works in practice; it is not a wire-level
+guarantee, so validate arguments on your side.
 
 ## Notes and limits
 
 - The CLI runs the full agent harness: expect ~14k prompt tokens of system context per
   call. The Infinite plan covers Pixis/Forge without a meter; other models spend credits.
-- `--mode ask` is used so the agent answers instead of editing files.
+- `--mode ask` is used so the agent answers instead of editing files. The prompt is sent to
+  the CLI on stdin.
 - Streaming granularity is limited by the CLI: it emits the final answer as one event, so
   the bridge splits that text into chunks. Time-to-first-token equals the model's
-  time-to-answer.
-- The bridge listens on loopback. If you expose it, put authentication in front.
+  time-to-answer. Direct mode streams real deltas.
+- The bridge listens on loopback by default. A non-loopback bind requires `MLAI_API_KEY`;
+  for remote use see "Exposing it beyond localhost".
 
 ## License
 

@@ -6,11 +6,13 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Usage mirrors the CLI's token accounting.
@@ -54,6 +56,29 @@ type streamEvent struct {
 	} `json:"error"`
 }
 
+// cappedBuffer is a goroutine-safe writer that keeps the first max bytes and
+// discards the rest.
+type cappedBuffer struct {
+	mu  sync.Mutex
+	buf []byte
+	max int
+}
+
+func (b *cappedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if room := b.max - len(b.buf); room > 0 {
+		b.buf = append(b.buf, p[:min(room, len(p))]...)
+	}
+	return len(p), nil
+}
+
+func (b *cappedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return string(b.buf)
+}
+
 // Runner shells out to `mlai`.
 type Runner struct {
 	Bin     string
@@ -64,7 +89,12 @@ type Runner struct {
 
 // Run executes one prompt and returns the answer. `cancel` kills the process.
 func (r *Runner) Run(ctx context.Context, prompt, model, effort string) RunResult {
-	args := []string{"-p", prompt, "--output-format", "stream-json", "--no-tui"}
+	if strings.TrimSpace(prompt) == "" {
+		return RunResult{Err: fmt.Errorf("empty prompt")}
+	}
+	// `-p` without a value reads the task from stdin, so the prompt can never be
+	// parsed as a flag and does not show up in the process list.
+	args := []string{"-p", "--output-format", "stream-json", "--no-tui"}
 	if model != "" {
 		args = append(args, "-m", model)
 	}
@@ -76,40 +106,28 @@ func (r *Runner) Run(ctx context.Context, prompt, model, effort string) RunResul
 
 	cmd := exec.CommandContext(ctx, r.Bin, args...)
 	cmd.Dir = r.WorkDir
-	cmd.Env = append(cmd.Environ(), "NO_COLOR=1", "CI=1", "TERM=dumb")
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return RunResult{Err: fmt.Errorf("stdout pipe: %w", err)}
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return RunResult{Err: fmt.Errorf("stderr pipe: %w", err)}
-	}
+	cmd.Env = append(childEnv(), "TERM=dumb")
+	cmd.Stdin = strings.NewReader(prompt)
+	setProcGroup(cmd)
+	cmd.Cancel = func() error { return killTree(cmd) }
+	cmd.WaitDelay = 5 * time.Second
+
+	pr, pw := io.Pipe()
+	cmd.Stdout = pw
+	stderr := &cappedBuffer{max: 16 << 10}
+	cmd.Stderr = stderr
 	if err := cmd.Start(); err != nil {
 		return RunResult{Err: fmt.Errorf("start mlai: %w", err)}
 	}
-
-	var (
-		res      RunResult
-		mu       sync.Mutex
-		errLines []string
-	)
+	waitCh := make(chan error, 1)
 	go func() {
-		sc := bufio.NewScanner(stderr)
-		for sc.Scan() {
-			line := strings.TrimSpace(sc.Text())
-			if line == "" {
-				continue
-			}
-			mu.Lock()
-			if len(errLines) < 20 {
-				errLines = append(errLines, line)
-			}
-			mu.Unlock()
-		}
+		err := cmd.Wait()
+		pw.Close()
+		waitCh <- err
 	}()
 
-	sc := bufio.NewScanner(stdout)
+	var res RunResult
+	sc := bufio.NewScanner(pr)
 	sc.Buffer(make([]byte, 1<<20), 4<<20)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -159,14 +177,33 @@ func (r *Runner) Run(ctx context.Context, prompt, model, effort string) RunResul
 			}
 		}
 	}
+	scanErr := sc.Err()
+	// Keep reading so the child never blocks on a full pipe (scanner stopped early).
+	io.Copy(io.Discard, pr)
+	waitErr := <-waitCh
+	if errors.Is(waitErr, exec.ErrWaitDelay) {
+		waitErr = nil // the process exited; only an inherited pipe held on
+	}
 
-	waitErr := cmd.Wait()
-	if waitErr != nil && res.Err == nil {
-		msg := strings.Join(errLines, " | ")
-		if msg == "" {
-			msg = waitErr.Error()
+	var errLines []string
+	for _, l := range strings.Split(stderr.String(), "\n") {
+		if l = strings.TrimSpace(l); l != "" && len(errLines) < 20 {
+			errLines = append(errLines, l)
 		}
-		res.Err = fmt.Errorf("%s", msg)
+	}
+	if scanErr != nil && res.Err == nil && res.Text == "" {
+		res.Err = scanErr
+	}
+	if waitErr != nil && res.Err == nil {
+		if cerr := ctx.Err(); cerr != nil {
+			res.Err = cerr // "context deadline exceeded" keeps classify at 504
+		} else {
+			msg := strings.Join(errLines, " | ")
+			if msg == "" {
+				msg = waitErr.Error()
+			}
+			res.Err = fmt.Errorf("%s", msg)
+		}
 	}
 	if res.Err == nil && strings.TrimSpace(res.Text) == "" {
 		msg := strings.Join(errLines, " | ")
@@ -177,14 +214,3 @@ func (r *Runner) Run(ctx context.Context, prompt, model, effort string) RunResul
 	}
 	return res
 }
-
-// RunText is a convenience for one-shot prompts (used by /healthz checks).
-func (r *Runner) RunText(ctx context.Context, prompt string) (string, error) {
-	out, err := exec.CommandContext(ctx, r.Bin, "-p", prompt, "--mode", "ask", "--output-format", "text", "--no-tui").CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("%s", strings.TrimSpace(string(out)))
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
-var _ = io.Discard

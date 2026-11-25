@@ -31,44 +31,32 @@ var (
 	errTimeout     = apiError{504, "server_error", "timeout", "timeout_error", "the agent took too long and was stopped"}
 	errUpstream    = apiError{502, "server_error", "upstream_error", "api_error", "the agent CLI failed"}
 	errUnavailable = apiError{503, "server_error", "unavailable", "overloaded_error", "bridge is not ready"}
+
+	errForbiddenHost = apiError{403, "permission_error", "forbidden_host", "permission_error", "request host is not allowed"}
+	errMediaType     = apiError{415, "invalid_request_error", "unsupported_media_type", "invalid_request_error", "Content-Type must be application/json"}
 )
 
-// classify maps a CLI error string to a stable apiError.
+// classify maps a CLI error string to a stable apiError. The preset message is
+// kept: raw CLI text can expose paths and account details.
 func classify(msg string) apiError {
 	m := strings.ToLower(msg)
 	switch {
 	case strings.Contains(m, "not signed in"), strings.Contains(m, "unauthorized"), strings.Contains(m, "credentials"):
-		e := errAuth
-		e.Message = msg
-		return e
+		return errAuth
 	case strings.Contains(m, "daily budget"), strings.Contains(m, "credits"), strings.Contains(m, "allowance"):
-		e := errBudget
-		e.Message = msg
-		return e
+		return errBudget
 	case strings.Contains(m, "too many requests"), strings.Contains(m, "hourly ceiling"), strings.Contains(m, "retry-after"), strings.Contains(m, "capacity"):
-		e := errRate
-		e.Message = msg
-		return e
+		return errRate
 	case strings.Contains(m, "out of date"), strings.Contains(m, "upgrade_required"):
-		e := errUpgrade
-		e.Message = msg
-		return e
+		return errUpgrade
 	case strings.Contains(m, "another free-pi session"), strings.Contains(m, "concurrent"):
-		e := errBusy
-		e.Message = msg
-		return e
+		return errBusy
 	case strings.Contains(m, "deadline exceeded"), strings.Contains(m, "killed"), strings.Contains(m, "timeout"):
-		e := errTimeout
-		e.Message = msg
-		return e
+		return errTimeout
 	case strings.Contains(m, "ubuntu"), strings.Contains(m, "no such file"), strings.Contains(m, "exec:"):
-		e := errUnavailable
-		e.Message = msg
-		return e
+		return errUnavailable
 	}
-	e := errUpstream
-	e.Message = msg
-	return e
+	return errUpstream
 }
 
 func writeOpenAIError(w http.ResponseWriter, e apiError, requestID string) {

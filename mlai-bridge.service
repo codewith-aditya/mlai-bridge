@@ -5,14 +5,33 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/root/mlai-bridge
-Environment=HOME=/root
+User=mlai
+Group=mlai
+StateDirectory=mlai-bridge
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/mlai-bridge
+Environment=HOME=/var/lib/mlai-bridge
 Environment=PATH=/opt/mlai/node_modules/.bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/root/mlai-bridge/mlai-bridge -port 8197 -workdir /root/mlai-bridge/workspace -model pixis-opus -concurrency 1 -mlai /opt/mlai/node_modules/.bin/mlai -bind 127.0.0.1 -api-key 0b943e9b56e1d088e205371d69fbd9dc0a9d77e5974fcb69
+# /etc/mlai-bridge/env (root:root, 0600) holds MLAI_API_KEY=...
+EnvironmentFile=/etc/mlai-bridge/env
+ExecStart=/opt/mlai-bridge/mlai-bridge -port 8197 -workdir /var/lib/mlai-bridge/workspace -model pixis-opus -concurrency 1 -mlai /opt/mlai/node_modules/.bin/mlai -bind 127.0.0.1
 Restart=always
 RestartSec=5
-StandardOutput=append:/var/log/mlai-bridge.log
-StandardError=append:/var/log/mlai-bridge.log
+UMask=0077
+
+# Hardening (no MemoryDenyWriteExecute: Node JIT; no RestrictNamespaces: CLI sandbox)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
 [Install]
 WantedBy=multi-user.target

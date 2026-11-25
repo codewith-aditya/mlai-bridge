@@ -187,6 +187,10 @@ type execResult struct {
 }
 
 func (s *server) execute(ctx context.Context, model, system string, msgs []chatMessage, tools []toolDef, effort string, maxTokens int) execResult {
+	if strings.HasPrefix(model, "-") { // never let a model id look like a CLI flag
+		e := errModel
+		return execResult{err: &e}
+	}
 	prompt := buildPrompt(system, msgs, tools)
 	noCache := s.cache == nil || len(tools) > 0
 	var key string
@@ -200,7 +204,7 @@ func (s *server) execute(ctx context.Context, model, system string, msgs []chatM
 		}
 	}
 
-	release, aerr := s.acquire(ctx)
+	release, aerr := s.acquire(ctx, s.sem)
 	if aerr != nil {
 		return execResult{err: aerr}
 	}
@@ -216,6 +220,7 @@ func (s *server) execute(ctx context.Context, model, system string, msgs []chatM
 	res := s.runner.Run(runCtx, prompt, model, effort)
 	if res.Err != nil {
 		requestsFailed.Add(1)
+		logger.Printf("cli error: %q", res.Err.Error())
 		e := classify(res.Err.Error())
 		return execResult{err: &e}
 	}
@@ -226,8 +231,23 @@ func (s *server) execute(ctx context.Context, model, system string, msgs []chatM
 	}
 	if len(tools) > 0 {
 		if calls, preamble := parseToolCalls(ca.Text); calls != nil {
-			ca.Tools = calls
-			ca.Text = preamble
+			// only calls to tools the client declared; otherwise the text stays as is
+			declared := make(map[string]bool, len(tools))
+			for _, t := range tools {
+				if n := t.toolName(); n != "" {
+					declared[n] = true
+				}
+			}
+			var kept []toolCallOut
+			for _, c := range calls {
+				if declared[c.Name] {
+					kept = append(kept, c)
+				}
+			}
+			if len(kept) > 0 {
+				ca.Tools = kept
+				ca.Text = preamble
+			}
 		}
 	}
 	ca.Usage.TotalTokens = ca.Usage.PromptTokens + ca.Usage.CompletionTokens
@@ -237,6 +257,36 @@ func (s *server) execute(ctx context.Context, model, system string, msgs []chatM
 		}
 	}
 	return execResult{answer: ca}
+}
+
+// serveDirect sends the request to the gateway and hands the response to serve,
+// which writes the client reply and reports whether it did. The direct slot is
+// released before it returns, so a CLI fallback never holds two slots. A non-nil
+// apiError ends the request: the direct slots are full. (false, nil) means fall
+// back to the CLI.
+func (s *server) serveDirect(parent context.Context, body []byte, stream bool, serve func(*http.Response) bool) (bool, *apiError) {
+	release, aerr := s.acquire(parent, s.directSem)
+	if aerr != nil {
+		return false, aerr
+	}
+	defer release()
+
+	activeRequests.Add(1)
+	defer activeRequests.Add(-1)
+
+	ctx, cancel := context.WithTimeout(parent, cfg.Timeout)
+	defer cancel()
+
+	resp, err := s.directRequest(ctx, body, stream)
+	if err != nil {
+		logger.Printf("direct path failed (%v) — falling back to CLI", err)
+		return false, nil
+	}
+	done := serve(resp)
+	if done {
+		requestsTotal.Add(1)
+	}
+	return done, nil
 }
 
 // ---------- OpenAI ----------
@@ -286,8 +336,7 @@ func (s *server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req openAIRequest
-	dec := json.NewDecoder(r.Body)
-	if err := dec.Decode(&req); err != nil {
+	if err := decodeBody(w, r, &req); err != nil {
 		e := errBadRequest
 		e.Message = "invalid JSON: " + err.Error()
 		writeOpenAIError(w, e, reqID)
@@ -320,31 +369,37 @@ func (s *server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	// Fast path: talk to the gateway directly — real token streaming, no CLI overhead.
 	if s.direct {
 		body := openAIBodyFromOpenAI(req, model)
-		if resp, derr := s.directRequest(r.Context(), body, req.Stream); derr == nil {
+		done, derr := s.serveDirect(r.Context(), body, req.Stream, func(resp *http.Response) bool {
 			if req.Stream {
 				copySSE(w, resp)
-				return
+				return true
 			}
-			text, gwModel, usage, aerr := aggregateGateway(resp)
-			if aerr == nil {
-				if gwModel == "" {
-					gwModel = model
-				}
-				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(map[string]any{
-					"id": fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()), "object": "chat.completion",
-					"created": time.Now().Unix(), "model": gwModel,
-					"choices": []map[string]any{{
-						"index": 0, "finish_reason": "stop",
-						"message": map[string]any{"role": "assistant", "content": text},
-					}},
-					"usage": usage,
-				})
-				return
+			text, gwModel, usage, err := aggregateGateway(resp)
+			if err != nil {
+				logger.Printf("direct aggregate failed: %v", err)
+				return false
 			}
-			logger.Printf("direct aggregate failed: %v", aerr)
-		} else {
-			logger.Printf("direct path failed (%v) — falling back to CLI", derr)
+			if gwModel == "" {
+				gwModel = model
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"id": fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()), "object": "chat.completion",
+				"created": time.Now().Unix(), "model": gwModel,
+				"choices": []map[string]any{{
+					"index": 0, "finish_reason": "stop",
+					"message": map[string]any{"role": "assistant", "content": text},
+				}},
+				"usage": usage,
+			})
+			return true
+		})
+		if derr != nil {
+			writeOpenAIError(w, *derr, reqID)
+			return
+		}
+		if done {
+			return
 		}
 	}
 
@@ -467,7 +522,7 @@ func (s *server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	var req anthropicRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeBody(w, r, &req); err != nil {
 		e := errBadRequest
 		e.Message = "invalid JSON: " + err.Error()
 		writeAnthropicError(w, e, reqID)
@@ -509,15 +564,20 @@ func (s *server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	// Fast path: gateway direct (real streaming), CLI as fallback.
 	if s.direct {
 		body := openAIBodyFromAnthropic(req, model)
-		if resp, derr := s.directRequest(r.Context(), body, req.Stream); derr == nil {
+		done, derr := s.serveDirect(r.Context(), body, req.Stream, func(resp *http.Response) bool {
 			if req.Stream {
 				streamToAnthropic(w, resp, model)
-				return
+			} else {
+				anthropicFromGateway(w, resp, model)
 			}
-			anthropicFromGateway(w, resp, model)
+			return true
+		})
+		if derr != nil {
+			writeAnthropicError(w, *derr, reqID)
 			return
-		} else {
-			logger.Printf("direct path failed (%v) — falling back to CLI", derr)
+		}
+		if done {
+			return
 		}
 	}
 
@@ -616,9 +676,16 @@ func (s *server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *server) handleCountTokens(w http.ResponseWriter, r *http.Request) {
+	reqID := w.Header().Get("X-Request-Id")
+	if r.Method != http.MethodPost {
+		writeAnthropicError(w, errBadRequest, reqID)
+		return
+	}
 	var req anthropicRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeAnthropicError(w, errBadRequest, w.Header().Get("X-Request-Id"))
+	if err := decodeBody(w, r, &req); err != nil {
+		e := errBadRequest
+		e.Message = "invalid JSON: " + err.Error()
+		writeAnthropicError(w, e, reqID)
 		return
 	}
 	n := 0

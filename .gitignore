@@ -7,3 +7,5 @@ workspace/
 
 # local secrets
 .apikey
+.env
+*.env
