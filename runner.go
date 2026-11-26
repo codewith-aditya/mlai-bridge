@@ -50,10 +50,27 @@ type streamEvent struct {
 	} `json:"usage"`
 	Credits float64 `json:"credits"`
 	Engine  string  `json:"engine"`
-	Error   *struct {
+	// Error is {"code","message"} or, from mlai 0.3.x, a plain string.
+	Error json.RawMessage `json:"error"`
+}
+
+// cliError returns the message of a stream-json error field, or "".
+func cliError(raw json.RawMessage) string {
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	var o struct {
 		Code    string `json:"code"`
 		Message string `json:"message"`
-	} `json:"error"`
+	}
+	if json.Unmarshal(raw, &o) != nil || o.Message == "" {
+		return ""
+	}
+	if o.Code == "" {
+		return o.Message
+	}
+	return o.Code + ": " + o.Message
 }
 
 // cappedBuffer is a goroutine-safe writer that keeps the first max bytes and
@@ -168,8 +185,8 @@ func (r *Runner) Run(ctx context.Context, prompt, model, effort string) RunResul
 			if ev.Model != "" {
 				res.Model = ev.Model
 			}
-			if ev.Error != nil && ev.Error.Message != "" {
-				res.Err = fmt.Errorf("%s: %s", ev.Error.Code, ev.Error.Message)
+			if msg := cliError(ev.Error); msg != "" {
+				res.Err = fmt.Errorf("%s", msg)
 			}
 		case "error":
 			if ev.Content != "" {

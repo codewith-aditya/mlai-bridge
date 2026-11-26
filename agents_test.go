@@ -182,3 +182,17 @@ func TestNoProxyCoversTheBridge(t *testing.T) {
 		t.Error(got)
 	}
 }
+
+func TestCLIErrorFormats(t *testing.T) {
+	for raw, want := range map[string]string{
+		`"Give a task: mlai -p \"what to do\""`: `Give a task: mlai -p "what to do"`,
+		`{"code":"x","message":"y"}`:            "x: y",
+		`{"message":"y"}`:                       "y",
+		`null`:                                  "",
+		``:                                      "",
+	} {
+		if got := cliError(json.RawMessage(raw)); got != want {
+			t.Errorf("cliError(%s) = %q, want %q", raw, got, want)
+		}
+	}
+}
